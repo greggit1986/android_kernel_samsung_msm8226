@@ -497,25 +497,6 @@ static inline int swp_swapcount(swp_entry_t entry)
 	return 0;
 }
 
-static inline int page_swapcount(struct page *page)
-{
-	return 0;
-}
-
-#define reuse_swap_page(page)	(page_mapcount(page) == 1)
-
-static inline int try_to_free_swap(struct page *page)
-{
-	return 0;
-}
-
-static inline swp_entry_t get_swap_page(void)
-{
-	swp_entry_t entry;
-	entry.val = 0;
-	return entry;
-}
-
 static inline void
 mem_cgroup_uncharge_swapcache(struct page *page, swp_entry_t ent)
 {
