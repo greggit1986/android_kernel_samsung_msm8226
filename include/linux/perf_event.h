@@ -258,6 +258,9 @@ struct perf_event_attr {
 				exclude_guest  :  1, /* don't count in guest  */
 				constraint_duplicate : 1,
 
+				exclude_callchain_kernel : 1, /* exclude kernel callchains */
+				exclude_callchain_user   : 1, /* exclude user callchains */
+
 				__reserved_1   : 42;
 
 	union {
