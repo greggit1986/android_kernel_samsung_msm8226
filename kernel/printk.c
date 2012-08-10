@@ -1292,6 +1292,7 @@ static int syslog_print_all(char __user *buf, int size, bool clear)
 			struct log *msg = log_from_idx(idx);
 
 			len += msg_print_text(msg, prev, true, NULL, 0);
+			prev = msg->flags;
 			idx = log_next(idx);
 			seq++;
 		}
@@ -1304,6 +1305,7 @@ static int syslog_print_all(char __user *buf, int size, bool clear)
 			struct log *msg = log_from_idx(idx);
 
 			len -= msg_print_text(msg, prev, true, NULL, 0);
+			prev = msg->flags;
 			idx = log_next(idx);
 			seq++;
 		}
