@@ -65,18 +65,6 @@ struct aio_ring {
 }; /* 128 bytes + ring size */
 
 #define AIO_RING_PAGES	8
-struct aio_ring_info {
-	unsigned long		mmap_base;
-	unsigned long		mmap_size;
-
-	struct page		**ring_pages;
-	spinlock_t		ring_lock;
-	long			nr_pages;
-
-	unsigned		nr, tail;
-
-	struct page		*internal_pages[AIO_RING_PAGES];
-};
 
 struct kioctx {
 	atomic_t		users;
@@ -97,14 +85,30 @@ struct kioctx {
 	 * This is what userspace passed to io_setup(), it's not used for
 	 * anything but counting against the global max_reqs quota.
 	 *
-	 * The real limit is ring->nr - 1, which will be larger (see
+	 * The real limit is nr_events - 1, which will be larger (see
 	 * aio_setup_ring())
 	 */
 	unsigned		max_reqs;
 
-	struct aio_ring_info	ring_info;
+	/* Size of ringbuffer, in units of struct io_event */
+	unsigned		nr_events;
 
-	spinlock_t		completion_lock;
+	unsigned long		mmap_base;
+	unsigned long		mmap_size;
+
+	struct page		**ring_pages;
+	long			nr_pages;
+
+	struct {
+		struct mutex	ring_lock;
+	} ____cacheline_aligned;
+
+	struct {
+		unsigned	tail;
+		spinlock_t	completion_lock;
+	} ____cacheline_aligned;
+
+	struct page		*internal_pages[AIO_RING_PAGES];
 
 	struct rcu_head		rcu_head;
 };
@@ -150,27 +154,21 @@ __initcall(aio_setup);
 
 static void aio_free_ring(struct kioctx *ctx)
 {
-	struct aio_ring_info *info = &ctx->ring_info;
 	long i;
 
-	for (i=0; i<info->nr_pages; i++)
-		put_page(info->ring_pages[i]);
+	for (i = 0; i < ctx->nr_pages; i++)
+		put_page(ctx->ring_pages[i]);
 
-	if (info->mmap_size) {
-		BUG_ON(ctx->mm != current->mm);
-		vm_munmap(info->mmap_base, info->mmap_size);
-	}
+	if (ctx->mmap_size)
+		vm_munmap(ctx->mmap_base, ctx->mmap_size);
 
-	if (info->ring_pages && info->ring_pages != info->internal_pages)
-		kfree(info->ring_pages);
-	info->ring_pages = NULL;
-	info->nr = 0;
+	if (ctx->ring_pages && ctx->ring_pages != ctx->internal_pages)
+		kfree(ctx->ring_pages);
 }
 
 static int aio_setup_ring(struct kioctx *ctx)
 {
 	struct aio_ring *ring;
-	struct aio_ring_info *info = &ctx->ring_info;
 	unsigned nr_events = ctx->max_reqs;
 	unsigned long size;
 	int nr_pages;
@@ -190,43 +188,44 @@ static int aio_setup_ring(struct kioctx *ctx)
 
 	nr_events = (PAGE_SIZE * nr_pages - sizeof(struct aio_ring)) / sizeof(struct io_event);
 
-	info->nr = 0;
-	info->ring_pages = info->internal_pages;
+	ctx->nr_events = 0;
+	ctx->ring_pages = ctx->internal_pages;
 	if (nr_pages > AIO_RING_PAGES) {
-		info->ring_pages = kcalloc(nr_pages, sizeof(struct page *), GFP_KERNEL);
-		if (!info->ring_pages)
+		ctx->ring_pages = kcalloc(nr_pages, sizeof(struct page *),
+					  GFP_KERNEL);
+		if (!ctx->ring_pages)
 			return -ENOMEM;
 	}
 
-	info->mmap_size = nr_pages * PAGE_SIZE;
-	dprintk("attempting mmap of %lu bytes\n", info->mmap_size);
-	down_write(&ctx->mm->mmap_sem);
-	info->mmap_base = do_mmap(NULL, 0, info->mmap_size, 
-				  PROT_READ|PROT_WRITE, MAP_ANONYMOUS|MAP_PRIVATE,
-				  0);
-	if (IS_ERR((void *)info->mmap_base)) {
-		up_write(&ctx->mm->mmap_sem);
-		info->mmap_size = 0;
+	ctx->mmap_size = nr_pages * PAGE_SIZE;
+	pr_debug("attempting mmap of %lu bytes\n", ctx->mmap_size);
+	down_write(&mm->mmap_sem);
+	ctx->mmap_base = do_mmap_pgoff(NULL, 0, ctx->mmap_size,
+				       PROT_READ|PROT_WRITE,
+				       MAP_ANONYMOUS|MAP_PRIVATE, 0, &populate);
+	if (IS_ERR((void *)ctx->mmap_base)) {
+		up_write(&mm->mmap_sem);
+		ctx->mmap_size = 0;
 		aio_free_ring(ctx);
 		return -EAGAIN;
 	}
 
-	dprintk("mmap address: 0x%08lx\n", info->mmap_base);
-	info->nr_pages = get_user_pages(current, ctx->mm,
-					info->mmap_base, nr_pages, 
-					1, 0, info->ring_pages, NULL);
-	up_write(&ctx->mm->mmap_sem);
+	pr_debug("mmap address: 0x%08lx\n", ctx->mmap_base);
+	ctx->nr_pages = get_user_pages(current, mm, ctx->mmap_base, nr_pages,
+				       1, 0, ctx->ring_pages, NULL);
+	up_write(&mm->mmap_sem);
 
-	if (unlikely(info->nr_pages != nr_pages)) {
+	if (unlikely(ctx->nr_pages != nr_pages)) {
 		aio_free_ring(ctx);
 		return -EAGAIN;
 	}
+	if (populate)
+		mm_populate(ctx->mmap_base, populate);
 
-	ctx->user_id = info->mmap_base;
+	ctx->user_id = ctx->mmap_base;
+	ctx->nr_events = nr_events; /* trusted copy */
 
-	info->nr = nr_events;		/* trusted copy */
-
-	ring = kmap_atomic(info->ring_pages[0]);
+	ring = kmap_atomic(ctx->ring_pages[0]);
 	ring->nr = nr_events;	/* user copy */
 	ring->id = ctx->user_id;
 	ring->head = ring->tail = 0;
@@ -235,6 +234,7 @@ static int aio_setup_ring(struct kioctx *ctx)
 	ring->incompat_features = AIO_RING_INCOMPAT_FEATURES;
 	ring->header_length = sizeof(struct aio_ring);
 	kunmap_atomic(ring);
+	flush_dcache_page(ctx->ring_pages[0]);
 
 	return 0;
 }
@@ -308,10 +308,6 @@ static void free_ioctx_rcu(struct rcu_head *head)
  */
 static void __put_ioctx(struct kioctx *ctx)
 {
-	unsigned nr_events = ctx->max_reqs;
-	BUG_ON(ctx->reqs_active);
-
-	struct aio_ring_info *info = &ctx->ring_info;
 	struct aio_ring *ring;
 	struct io_event res;
 	struct kiocb *req;
@@ -329,18 +325,18 @@ static void __put_ioctx(struct kioctx *ctx)
 
 	spin_unlock_irq(&ctx->ctx_lock);
 
-	ring = kmap_atomic(info->ring_pages[0]);
+	ring = kmap_atomic(ctx->ring_pages[0]);
 	head = ring->head;
 	kunmap_atomic(ring);
 
 	while (atomic_read(&ctx->reqs_active) > 0) {
-		wait_event(ctx->wait, head != info->tail);
+		wait_event(ctx->wait, head != ctx->tail);
 
-		avail = (head <= info->tail ? info->tail : info->nr) - head;
+		avail = (head <= ctx->tail ? ctx->tail : ctx->nr_events) - head;
 
 		atomic_sub(avail, &ctx->reqs_active);
 		head += avail;
-		head %= info->nr;
+		head %= ctx->nr_events;
 	}
 
 	WARN_ON(atomic_read(&ctx->reqs_active) < 0);
@@ -401,7 +397,7 @@ static struct kioctx *ioctx_alloc(unsigned nr_events)
 	atomic_set(&ctx->users, 2);
 	spin_lock_init(&ctx->ctx_lock);
 	spin_lock_init(&ctx->completion_lock);
-	mutex_init(&ctx->ring_info.ring_lock);
+	mutex_init(&ctx->ring_lock);
 	init_waitqueue_head(&ctx->wait);
 
 	INIT_LIST_HEAD(&ctx->active_reqs);
@@ -426,8 +422,8 @@ static struct kioctx *ioctx_alloc(unsigned nr_events)
 	hlist_add_head_rcu(&ctx->list, &mm->ioctx_list);
 	spin_unlock(&mm->ioctx_lock);
 
-	dprintk("aio: allocated ioctx %p[%ld]: mm=%p mask=0x%x\n",
-		ctx, ctx->user_id, current->mm, ctx->ring_info.nr);
+	pr_debug("allocated ioctx %p[%ld]: mm=%p mask=0x%x\n",
+		 ctx, ctx->user_id, mm, ctx->nr_events);
 	return ctx;
 
 out_cleanup:
@@ -534,8 +530,12 @@ void exit_aio(struct mm_struct *mm)
 		 * That way we get all munmap done to current->mm -
 		 * all other callers have ctx->mm == current->mm.
 		 */
-		ctx->ring_info.mmap_size = 0;
-		put_ioctx(ctx);
+		ctx->mmap_size = 0;
+
+		if (!atomic_xchg(&ctx->dead, 1)) {
+			hlist_del_rcu(&ctx->list);
+			call_rcu(&ctx->rcu_head, kill_ioctx_rcu);
+		}
 	}
 }
 
@@ -553,10 +553,10 @@ static inline struct kiocb *aio_get_req(struct kioctx *ctx)
 {
 	struct kiocb *req;
 
-	if (atomic_read(&ctx->reqs_active) >= ctx->ring_info.nr)
+	if (atomic_read(&ctx->reqs_active) >= ctx->nr_events)
 		return NULL;
 
-	if (atomic_inc_return(&ctx->reqs_active) > ctx->ring_info.nr - 1)
+	if (atomic_inc_return(&ctx->reqs_active) > ctx->nr_events - 1)
 		goto out_put;
 
 	req = kmem_cache_alloc(kiocb_cachep, GFP_KERNEL|__GFP_ZERO);
@@ -978,7 +978,6 @@ EXPORT_SYMBOL(kick_iocb);
 int aio_complete(struct kiocb *iocb, long res, long res2)
 {
 	struct kioctx	*ctx = iocb->ki_ctx;
-	struct aio_ring_info	*info;
 	struct aio_ring	*ring;
 	struct io_event	*event;
 	unsigned long	flags;
@@ -999,8 +998,6 @@ int aio_complete(struct kiocb *iocb, long res, long res2)
 		wake_up_process(iocb->ki_obj.tsk);
 		return 1;
 	}
-
-	info = &ctx->ring_info;
 
 	/*
 	 * Take rcu_read_lock() in case the kioctx is being destroyed, as we
@@ -1034,33 +1031,39 @@ int aio_complete(struct kiocb *iocb, long res, long res2)
 	 */
 	spin_lock_irqsave(&ctx->completion_lock, flags);
 
-	tail = info->tail;
+	tail = ctx->tail;
 	pos = tail + AIO_EVENTS_OFFSET;
 
-	tail = info->tail;
-	event = aio_ring_event(info, tail);
-	if (++tail >= info->nr)
+	if (++tail >= ctx->nr_events)
 		tail = 0;
+
+	ev_page = kmap_atomic(ctx->ring_pages[pos / AIO_EVENTS_PER_PAGE]);
+	event = ev_page + pos % AIO_EVENTS_PER_PAGE;
 
 	event->obj = (u64)(unsigned long)iocb->ki_obj.user;
 	event->data = iocb->ki_user_data;
 	event->res = res;
 	event->res2 = res2;
 
-	dprintk("aio_complete: %p[%lu]: %p: %p %Lx %lx %lx\n",
-		ctx, tail, iocb, iocb->ki_obj.user, iocb->ki_user_data,
-		res, res2);
+	kunmap_atomic(ev_page);
+	flush_dcache_page(ctx->ring_pages[pos / AIO_EVENTS_PER_PAGE]);
+
+	pr_debug("%p[%u]: %p: %p %Lx %lx %lx\n",
+		 ctx, tail, iocb, iocb->ki_obj.user, iocb->ki_user_data,
+		 res, res2);
 
 	/* after flagging the request as done, we
 	 * must never even look at it again
 	 */
 	smp_wmb();	/* make event visible before updating tail */
 
-	info->tail = tail;
-	ring->tail = tail;
+	ctx->tail = tail;
 
+	ring = kmap_atomic(ctx->ring_pages[0]);
+	ring->tail = tail;
 	put_aio_ring_event(event);
 	kunmap_atomic(ring);
+	flush_dcache_page(ctx->ring_pages[0]);
 
 	spin_unlock_irqrestore(&ctx->completion_lock, flags);
 
@@ -1101,60 +1104,29 @@ EXPORT_SYMBOL(aio_complete);
  */
 static int aio_read_evt(struct kioctx *ioctx, struct io_event *ent)
 {
-	struct aio_ring_info *info = &ioctx->ring_info;
 	struct aio_ring *ring;
-	unsigned long head;
-	int ret = 0;
+	unsigned head, pos;
+	long ret = 0;
+	int copy_ret;
 
-	ring = kmap_atomic(info->ring_pages[0]);
-	dprintk("in aio_read_evt h%lu t%lu m%lu\n",
-		 (unsigned long)ring->head, (unsigned long)ring->tail,
-		 (unsigned long)ring->nr);
+	mutex_lock(&ctx->ring_lock);
 
-	if (ring->head == ring->tail)
-		goto out;
-
-	spin_lock(&info->ring_lock);
-
-	head = ring->head % info->nr;
-	if (head != ring->tail) {
-		struct io_event *evp = aio_ring_event(info, head);
-		*ent = *evp;
-		head = (head + 1) % info->nr;
-		smp_mb(); /* finish reading the event before updatng the head */
-		ring->head = head;
-		ret = 1;
-		put_aio_ring_event(evp);
-	}
-	spin_unlock(&info->ring_lock);
-
-out:
-	dprintk("leaving aio_read_evt: %d  h%lu t%lu\n", ret,
-		 (unsigned long)ring->head, (unsigned long)ring->tail);
+	ring = kmap_atomic(ctx->ring_pages[0]);
+	head = ring->head;
 	kunmap_atomic(ring);
 	return ret;
-}
+	pr_debug("h%u t%u m%u\n", head, ctx->tail, ctx->nr_events);
 
-struct aio_timeout {
-	struct timer_list	timer;
-	int			timed_out;
-	struct task_struct	*p;
-};
-
-static void timeout_func(unsigned long data)
-{
-	struct aio_timeout *to = (struct aio_timeout *)data;
+	if (head == ctx->tail)
+		goto out;
 
 	to->timed_out = 1;
 	wake_up_process(to->p);
 }
 
-static inline void init_timeout(struct aio_timeout *to)
-{
-	setup_timer_on_stack(&to->timer, timeout_func, (unsigned long) to);
-	to->timed_out = 0;
-	to->p = current;
-}
+		avail = (head <= ctx->tail ? ctx->tail : ctx->nr_events) - head;
+		if (head == ctx->tail)
+			break;
 
 static inline void set_timeout(long start_jiffies, struct aio_timeout *to,
 			       const struct timespec *ts)
@@ -1166,10 +1138,9 @@ static inline void set_timeout(long start_jiffies, struct aio_timeout *to,
 		to->timed_out = 1;
 }
 
-static inline void clear_timeout(struct aio_timeout *to)
-{
-	del_singleshot_timer_sync(&to->timer);
-}
+		pos = head + AIO_EVENTS_OFFSET;
+		page = ctx->ring_pages[pos / AIO_EVENTS_PER_PAGE];
+		pos %= AIO_EVENTS_PER_PAGE;
 
 static int read_events(struct kioctx *ctx,
 			long min_nr, long nr,
@@ -1205,24 +1176,22 @@ retry:
 			dprintk("aio: lost an event due to EFAULT.\n");
 			break;
 		}
-		ret = 0;
 
-		/* Good, event copied to userland, update counts. */
-		event ++;
-		i ++;
+		ret += avail;
+		head += avail;
+		head %= ctx->nr_events;
 	}
 
-	if (min_nr <= i)
-		return i;
-	if (ret)
-		return ret;
+	ring = kmap_atomic(ctx->ring_pages[0]);
+	ring->head = head;
+	kunmap_atomic(ring);
+	flush_dcache_page(ctx->ring_pages[0]);
 
-	/* End fast path */
-	pr_debug("%li  h%u t%u\n", ret, head, info->tail);
+	pr_debug("%li  h%u t%u\n", ret, head, ctx->tail);
 
 	atomic_sub(ret, &ctx->reqs_active);
 out:
-	mutex_unlock(&info->ring_lock);
+	mutex_unlock(&ctx->ring_lock);
 
 	/* racey check, but it gets redone */
 	if (!retry && unlikely(!list_empty(&ctx->run_list))) {
@@ -1669,7 +1638,6 @@ static int io_submit_one(struct kioctx *ctx, struct iocb __user *user_iocb,
 	req->ki_opcode = iocb->aio_lio_opcode;
 
 	ret = aio_setup_iocb(req, compat);
-
 	if (ret)
 		goto out_put_req;
 
@@ -1874,7 +1842,6 @@ SYSCALL_DEFINE5(io_getevents, aio_context_t, ctx_id,
 			ret = read_events(ioctx, min_nr, nr, events, timeout);
 		put_ioctx(ioctx);
 	}
-
 	asmlinkage_protect(5, ret, ctx_id, min_nr, nr, events, timeout);
 	return ret;
 }
