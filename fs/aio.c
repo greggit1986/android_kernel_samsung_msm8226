@@ -104,6 +104,8 @@ struct kioctx {
 
 	struct aio_ring_info	ring_info;
 
+	spinlock_t		completion_lock;
+
 	struct rcu_head		rcu_head;
 };
 
@@ -245,22 +247,56 @@ static int aio_setup_ring(struct kioctx *ctx)
 #define AIO_EVENTS_FIRST_PAGE	((PAGE_SIZE - sizeof(struct aio_ring)) / sizeof(struct io_event))
 #define AIO_EVENTS_OFFSET	(AIO_EVENTS_PER_PAGE - AIO_EVENTS_FIRST_PAGE)
 
-#define aio_ring_event(info, nr) ({					\
-	unsigned pos = (nr) + AIO_EVENTS_OFFSET;			\
-	struct io_event *__event;					\
-	__event = kmap_atomic(						\
-			(info)->ring_pages[pos / AIO_EVENTS_PER_PAGE]); \
-	__event += pos % AIO_EVENTS_PER_PAGE;				\
-	__event;							\
-})
+void kiocb_set_cancel_fn(struct kiocb *req, kiocb_cancel_fn *cancel)
+{
+	struct kioctx *ctx = req->ki_ctx;
+	unsigned long flags;
 
-#define put_aio_ring_event(event) do {		\
-	struct io_event *__event = (event);	\
-	(void)__event;				\
-	kunmap_atomic((void *)((unsigned long)__event & PAGE_MASK)); \
-} while(0)
+	spin_lock_irqsave(&ctx->ctx_lock, flags);
 
-static void ctx_rcu_free(struct rcu_head *head)
+	if (!req->ki_list.next)
+		list_add(&req->ki_list, &ctx->active_reqs);
+
+	req->ki_cancel = cancel;
+
+	spin_unlock_irqrestore(&ctx->ctx_lock, flags);
+}
+EXPORT_SYMBOL(kiocb_set_cancel_fn);
+
+static int kiocb_cancel(struct kioctx *ctx, struct kiocb *kiocb,
+			struct io_event *res)
+{
+	kiocb_cancel_fn *old, *cancel;
+	int ret = -EINVAL;
+
+	/*
+	 * Don't want to set kiocb->ki_cancel = KIOCB_CANCELLED unless it
+	 * actually has a cancel function, hence the cmpxchg()
+	 */
+
+	cancel = ACCESS_ONCE(kiocb->ki_cancel);
+	do {
+		if (!cancel || cancel == KIOCB_CANCELLED)
+			return ret;
+
+		old = cancel;
+		cancel = cmpxchg(&kiocb->ki_cancel, old, KIOCB_CANCELLED);
+	} while (cancel != old);
+
+	atomic_inc(&kiocb->ki_users);
+	spin_unlock_irq(&ctx->ctx_lock);
+
+	memset(res, 0, sizeof(*res));
+	res->obj = (u64)(unsigned long)kiocb->ki_obj.user;
+	res->data = kiocb->ki_user_data;
+	ret = cancel(kiocb, res);
+
+	spin_lock_irq(&ctx->ctx_lock);
+
+	return ret;
+}
+
+static void free_ioctx_rcu(struct rcu_head *head)
 {
 	struct kioctx *ctx = container_of(head, struct kioctx, rcu_head);
 	kmem_cache_free(kioctx_cachep, ctx);
@@ -330,7 +366,8 @@ static struct kioctx *ioctx_alloc(unsigned nr_events)
 
 	atomic_set(&ctx->users, 2);
 	spin_lock_init(&ctx->ctx_lock);
-	spin_lock_init(&ctx->ring_info.ring_lock);
+	spin_lock_init(&ctx->completion_lock);
+	mutex_init(&ctx->ring_info.ring_lock);
 	init_waitqueue_head(&ctx->wait);
 
 	INIT_LIST_HEAD(&ctx->active_reqs);
@@ -482,21 +519,12 @@ static struct kiocb *__aio_get_req(struct kioctx *ctx)
 {
 	struct kiocb *req = NULL;
 
-	req = kmem_cache_alloc(kiocb_cachep, GFP_KERNEL);
+	req = kmem_cache_alloc(kiocb_cachep, GFP_KERNEL|__GFP_ZERO);
 	if (unlikely(!req))
 		return NULL;
 
-	req->ki_flags = 0;
-	req->ki_users = 2;
-	req->ki_key = 0;
+	atomic_set(&req->ki_users, 2);
 	req->ki_ctx = ctx;
-	req->ki_cancel = NULL;
-	req->ki_retry = NULL;
-	req->ki_dtor = NULL;
-	req->private = NULL;
-	req->ki_iovec = NULL;
-	INIT_LIST_HEAD(&req->ki_run_list);
-	req->ki_eventfd = NULL;
 
 	return req;
 }
@@ -527,7 +555,6 @@ static void kiocb_batch_free(struct kioctx *ctx, struct kiocb_batch *batch)
 	spin_lock_irq(&ctx->ctx_lock);
 	list_for_each_entry_safe(req, n, &batch->head, ki_batch) {
 		list_del(&req->ki_batch);
-		list_del(&req->ki_list);
 		kmem_cache_free(kiocb_cachep, req);
 		ctx->reqs_active--;
 	}
@@ -593,10 +620,7 @@ retry:
 	}
 
 	batch->count -= allocated;
-	list_for_each_entry(req, &batch->head, ki_batch) {
-		list_add(&req->ki_list, &ctx->active_reqs);
-		ctx->reqs_active++;
-	}
+	atomic_add(allocated, &ctx->reqs_active);
 
 	kunmap_atomic(ring);
 	spin_unlock_irq(&ctx->ctx_lock);
@@ -1048,25 +1072,37 @@ int aio_complete(struct kiocb *iocb, long res, long res2)
 
 	info = &ctx->ring_info;
 
-	/* add a completion event to the ring buffer.
-	 * must be done holding ctx->ctx_lock to prevent
-	 * other code from messing with the tail
-	 * pointer since we might be called from irq
-	 * context.
+	/*
+	 * Take rcu_read_lock() in case the kioctx is being destroyed, as we
+	 * need to issue a wakeup after decrementing reqs_active.
 	 */
-	spin_lock_irqsave(&ctx->ctx_lock, flags);
+	rcu_read_lock();
 
-	if (iocb->ki_run_list.prev && !list_empty(&iocb->ki_run_list))
-		list_del_init(&iocb->ki_run_list);
+	if (iocb->ki_list.next) {
+		unsigned long flags;
+
+		spin_lock_irqsave(&ctx->ctx_lock, flags);
+		list_del(&iocb->ki_list);
+		spin_unlock_irqrestore(&ctx->ctx_lock, flags);
+	}
 
 	/*
 	 * cancelled requests don't get events, userland was given one
 	 * when the event got cancelled.
 	 */
-	if (kiocbIsCancelled(iocb))
+	if (unlikely(xchg(&iocb->ki_cancel,
+			  KIOCB_CANCELLED) == KIOCB_CANCELLED))
 		goto put_rq;
 
-	ring = kmap_atomic(info->ring_pages[0]);
+	/*
+	 * Add a completion event to the ring buffer. Must be done holding
+	 * ctx->ctx_lock to prevent other code from messing with the tail
+	 * pointer since we might be called from irq context.
+	 */
+	spin_lock_irqsave(&ctx->completion_lock, flags);
+
+	tail = info->tail;
+	pos = tail + AIO_EVENTS_OFFSET;
 
 	tail = info->tail;
 	event = aio_ring_event(info, tail);
@@ -1093,7 +1129,9 @@ int aio_complete(struct kiocb *iocb, long res, long res2)
 	put_aio_ring_event(event);
 	kunmap_atomic(ring);
 
-	pr_debug("added to ring %p at [%lu]\n", iocb, tail);
+	spin_unlock_irqrestore(&ctx->completion_lock, flags);
+
+	pr_debug("added to ring %p at [%u]\n", iocb, tail);
 
 	/*
 	 * Check if the user asked us to deliver the result through an
@@ -1118,8 +1156,7 @@ put_rq:
 	if (waitqueue_active(&ctx->wait))
 		wake_up(&ctx->wait);
 
-	spin_unlock_irqrestore(&ctx->ctx_lock, flags);
-	return ret;
+	rcu_read_unlock();
 }
 EXPORT_SYMBOL(aio_complete);
 
@@ -1704,29 +1741,17 @@ static int io_submit_one(struct kioctx *ctx, struct iocb __user *user_iocb,
 	if (ret)
 		goto out_put_req;
 
-	spin_lock_irq(&ctx->ctx_lock);
-	/*
-	 * We could have raced with io_destroy() and are currently holding a
-	 * reference to ctx which should be destroyed. We cannot submit IO
-	 * since ctx gets freed as soon as io_submit() puts its reference.  The
-	 * check here is reliable: io_destroy() sets ctx->dead before waiting
-	 * for outstanding IO and the barrier between these two is realized by
-	 * unlock of mm->ioctx_lock and lock of ctx->ctx_lock.  Analogously we
-	 * increment ctx->reqs_active before checking for ctx->dead and the
-	 * barrier is realized by unlock and lock of ctx->ctx_lock. Thus if we
-	 * don't see ctx->dead set here, io_destroy() waits for our IO to
-	 * finish.
-	 */
-	if (ctx->dead) {
-		spin_unlock_irq(&ctx->ctx_lock);
-		ret = -EINVAL;
-		goto out_put_req;
-	}
-	aio_run_iocb(req);
-	if (!list_empty(&ctx->run_list)) {
-		/* drain the run list */
-		while (__aio_run_iocbs(ctx))
-			;
+	ret = req->ki_retry(req);
+	if (ret != -EIOCBQUEUED) {
+		/*
+		 * There's no easy way to restart the syscall since other AIO's
+		 * may be already running. Just fail this IO with EINTR.
+		 */
+		if (unlikely(ret == -ERESTARTSYS || ret == -ERESTARTNOINTR ||
+			     ret == -ERESTARTNOHAND ||
+			     ret == -ERESTART_RESTARTBLOCK))
+			ret = -EINTR;
+		aio_complete(req, ret, 0);
 	}
 	spin_unlock_irq(&ctx->ctx_lock);
 
@@ -1734,6 +1759,7 @@ static int io_submit_one(struct kioctx *ctx, struct iocb __user *user_iocb,
 	return 0;
 
 out_put_req:
+	atomic_dec(&ctx->reqs_active);
 	aio_put_req(req);	/* drop extra ref to req */
 	aio_put_req(req);	/* drop i/o ref to req */
 	return ret;
