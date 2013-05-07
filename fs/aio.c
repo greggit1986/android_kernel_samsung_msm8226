@@ -78,12 +78,6 @@ struct aio_ring_info {
 	struct page		*internal_pages[AIO_RING_PAGES];
 };
 
-static inline unsigned aio_ring_avail(struct aio_ring_info *info,
-					struct aio_ring *ring)
-{
-	return (ring->head + info->nr - 1 - ring->tail) % info->nr;
-}
-
 struct kioctx {
 	atomic_t		users;
 	int			dead;
@@ -99,7 +93,13 @@ struct kioctx {
 	int			reqs_active;
 	struct list_head	active_reqs;	/* used for cancellation */
 
-	/* sys_io_setup currently limits this to an unsigned int */
+	/*
+	 * This is what userspace passed to io_setup(), it's not used for
+	 * anything but counting against the global max_reqs quota.
+	 *
+	 * The real limit is ring->nr - 1, which will be larger (see
+	 * aio_setup_ring())
+	 */
 	unsigned		max_reqs;
 
 	struct aio_ring_info	ring_info;
@@ -310,6 +310,40 @@ static void __put_ioctx(struct kioctx *ctx)
 {
 	unsigned nr_events = ctx->max_reqs;
 	BUG_ON(ctx->reqs_active);
+
+	struct aio_ring_info *info = &ctx->ring_info;
+	struct aio_ring *ring;
+	struct io_event res;
+	struct kiocb *req;
+	unsigned head, avail;
+
+	spin_lock_irq(&ctx->ctx_lock);
+
+	while (!list_empty(&ctx->active_reqs)) {
+		req = list_first_entry(&ctx->active_reqs,
+				       struct kiocb, ki_list);
+
+		list_del_init(&req->ki_list);
+		kiocb_cancel(ctx, req, &res);
+	}
+
+	spin_unlock_irq(&ctx->ctx_lock);
+
+	ring = kmap_atomic(info->ring_pages[0]);
+	head = ring->head;
+	kunmap_atomic(ring);
+
+	while (atomic_read(&ctx->reqs_active) > 0) {
+		wait_event(ctx->wait, head != info->tail);
+
+		avail = (head <= info->tail ? info->tail : info->nr) - head;
+
+		atomic_sub(avail, &ctx->reqs_active);
+		head += avail;
+		head %= info->nr;
+	}
+
+	WARN_ON(atomic_read(&ctx->reqs_active) < 0);
 
 	cancel_delayed_work_sync(&ctx->wq);
 	aio_free_ring(ctx);
@@ -573,7 +607,6 @@ static int kiocb_batch_refill(struct kioctx *ctx, struct kiocb_batch *batch)
 	long avail;
 	bool called_fput = false;
 	struct kiocb *req, *n;
-	struct aio_ring *ring;
 
 	to_alloc = min(batch->count, KIOCB_BATCH_SIZE);
 	for (allocated = 0; allocated < to_alloc; allocated++) {
@@ -589,9 +622,8 @@ static int kiocb_batch_refill(struct kioctx *ctx, struct kiocb_batch *batch)
 
 retry:
 	spin_lock_irq(&ctx->ctx_lock);
-	ring = kmap_atomic(ctx->ring_info.ring_pages[0]);
 
-	avail = aio_ring_avail(&ctx->ring_info, ring) - ctx->reqs_active;
+	avail = ctx->ring_info.nr - atomic_read(&ctx->reqs_active) - 1;
 	BUG_ON(avail < 0);
 	if (avail == 0 && !called_fput) {
 		/*
@@ -622,7 +654,6 @@ retry:
 	batch->count -= allocated;
 	atomic_add(allocated, &ctx->reqs_active);
 
-	kunmap_atomic(ring);
 	spin_unlock_irq(&ctx->ctx_lock);
 
 out:
@@ -1091,8 +1122,11 @@ int aio_complete(struct kiocb *iocb, long res, long res2)
 	 * when the event got cancelled.
 	 */
 	if (unlikely(xchg(&iocb->ki_cancel,
-			  KIOCB_CANCELLED) == KIOCB_CANCELLED))
+			  KIOCB_CANCELLED) == KIOCB_CANCELLED)) {
+		atomic_dec(&ctx->reqs_active);
+		/* Still need the wake_up in case free_ioctx is waiting */
 		goto put_rq;
+	}
 
 	/*
 	 * Add a completion event to the ring buffer. Must be done holding
@@ -1143,7 +1177,7 @@ int aio_complete(struct kiocb *iocb, long res, long res2)
 
 put_rq:
 	/* everything turned out well, dispose of the aiocb. */
-	ret = __aio_put_req(ctx, iocb);
+	aio_put_req(iocb);
 
 	/*
 	 * We have to order our ring_info tail store above and test
@@ -1285,6 +1319,11 @@ retry:
 		return ret;
 
 	/* End fast path */
+	pr_debug("%li  h%u t%u\n", ret, head, info->tail);
+
+	atomic_sub(ret, &ctx->reqs_active);
+out:
+	mutex_unlock(&info->ring_lock);
 
 	/* racey check, but it gets redone */
 	if (!retry && unlikely(!list_empty(&ctx->run_list))) {
