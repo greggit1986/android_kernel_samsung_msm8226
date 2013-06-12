@@ -163,9 +163,6 @@ static void aio_free_ring(struct kioctx *ctx)
 	for (i = 0; i < ctx->nr_pages; i++)
 		put_page(ctx->ring_pages[i]);
 
-	if (ctx->mmap_size)
-		vm_munmap(ctx->mmap_base, ctx->mmap_size);
-
 	if (ctx->ring_pages && ctx->ring_pages != ctx->internal_pages)
 		kfree(ctx->ring_pages);
 }
@@ -361,10 +358,22 @@ static void __put_ioctx(struct kioctx *ctx)
 	call_rcu(&ctx->rcu_head, ctx_rcu_free);
 }
 
+/*
 static inline int try_get_ioctx(struct kioctx *kioctx)
 {
 	return atomic_inc_not_zero(&kioctx->users);
-}
+}*/
+
+	pr_debug("freeing %p\n", ctx);
+
+	/*
+	 * Here the call_rcu() is between the wait_event() for reqs_active to
+	 * hit 0, and freeing the ioctx.
+	 *
+	 * aio_complete() decrements reqs_active, but it has to touch the ioctx
+	 * after to issue a wakeup so we use rcu.
+	 */
+	call_rcu(&ctx->rcu_head, free_ioctx_rcu);
 
 static inline void put_ioctx(struct kioctx *kioctx)
 {
@@ -449,37 +458,26 @@ out_freectx:
  */
 static void kill_ctx(struct kioctx *ctx)
 {
-	int (*cancel)(struct kiocb *, struct io_event *);
-	struct task_struct *tsk = current;
-	DECLARE_WAITQUEUE(wait, tsk);
-	struct io_event res;
+	if (!atomic_xchg(&ctx->dead, 1)) {
+		hlist_del_rcu(&ctx->list);
 
-	spin_lock_irq(&ctx->ctx_lock);
-	ctx->dead = 1;
-	while (!list_empty(&ctx->active_reqs)) {
-		struct list_head *pos = ctx->active_reqs.next;
-		struct kiocb *iocb = list_kiocb(pos);
-		list_del_init(&iocb->ki_list);
-		cancel = iocb->ki_cancel;
-		kiocbSetCancelled(iocb);
-		if (cancel) {
-			iocb->ki_users++;
-			spin_unlock_irq(&ctx->ctx_lock);
-			cancel(iocb, &res);
-			spin_lock_irq(&ctx->ctx_lock);
-		}
-	}
+		/*
+		 * It'd be more correct to do this in free_ioctx(), after all
+		 * the outstanding kiocbs have finished - but by then io_destroy
+		 * has already returned, so io_setup() could potentially return
+		 * -EAGAIN with no ioctxs actually in use (as far as userspace
+		 *  could tell).
+		 */
+		spin_lock(&aio_nr_lock);
+		BUG_ON(aio_nr - ctx->max_reqs > aio_nr);
+		aio_nr -= ctx->max_reqs;
+		spin_unlock(&aio_nr_lock);
 
-	if (!ctx->reqs_active)
-		goto out;
+		if (ctx->mmap_size)
+			vm_munmap(ctx->mmap_base, ctx->mmap_size);
 
-	add_wait_queue(&ctx->wait, &wait);
-	set_task_state(tsk, TASK_UNINTERRUPTIBLE);
-	while (ctx->reqs_active) {
-		spin_unlock_irq(&ctx->ctx_lock);
-		io_schedule();
-		set_task_state(tsk, TASK_UNINTERRUPTIBLE);
-		spin_lock_irq(&ctx->ctx_lock);
+		/* Between hlist_del_rcu() and dropping the initial ref */
+		call_rcu(&ctx->rcu_head, kill_ioctx_rcu);
 	}
 	__set_task_state(tsk, TASK_RUNNING);
 	remove_wait_queue(&ctx->wait, &wait);
@@ -538,10 +536,7 @@ void exit_aio(struct mm_struct *mm)
 		 */
 		ctx->mmap_size = 0;
 
-		if (!atomic_xchg(&ctx->dead, 1)) {
-			hlist_del_rcu(&ctx->list);
-			call_rcu(&ctx->rcu_head, kill_ioctx_rcu);
-		}
+		kill_ioctx(ctx);
 	}
 }
 
