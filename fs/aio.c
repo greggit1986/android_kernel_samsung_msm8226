@@ -1123,9 +1123,12 @@ static int aio_read_evt(struct kioctx *ioctx, struct io_event *ent)
 	if (head == ctx->tail)
 		goto out;
 
-	to->timed_out = 1;
-	wake_up_process(to->p);
-}
+	head %= ctx->nr_events;
+
+	while (ret < nr) {
+		long avail;
+		struct io_event *ev;
+		struct page *page;
 
 		avail = (head <= ctx->tail ? ctx->tail : ctx->nr_events) - head;
 		if (head == ctx->tail)
