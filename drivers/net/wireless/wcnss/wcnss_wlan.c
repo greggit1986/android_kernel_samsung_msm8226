@@ -1373,7 +1373,7 @@ void wcnss_wlan_unregister_pm_ops(struct device *dev,
 	if (penv && dev && (dev == &penv->pdev->dev) && pm_ops) {
 		if (penv->pm_ops == NULL) {
 			pr_err("%s: pm_ops is already unregistered.\n",
-				__func__);
+				 __func__);
 			return;
 		}
 		if (pm_ops->suspend != penv->pm_ops->suspend ||
