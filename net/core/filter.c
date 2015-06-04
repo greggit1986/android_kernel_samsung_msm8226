@@ -1240,7 +1240,8 @@ static u64 bpf_skb_store_bytes(u64 r1, u64 r2, u64 r3, u64 r4, u64 flags)
 	if (unlikely(offset > 0xffff || len > sizeof(buf)))
 		return -EFAULT;
 
-	if (skb_cloned(skb) && !skb_clone_writable(skb, offset + len))
+	if (unlikely(skb_cloned(skb) &&
+		     !skb_clone_writable(skb, offset + len)))
 		return -EFAULT;
 
 	ptr = skb_header_pointer(skb, offset, len, buf);
@@ -1283,7 +1284,8 @@ static u64 bpf_l3_csum_replace(u64 r1, u64 offset, u64 from, u64 to, u64 flags)
 	if (unlikely(offset > 0xffff))
 		return -EFAULT;
 
-	if (skb_cloned(skb) && !skb_clone_writable(skb, offset + sizeof(sum)))
+	if (unlikely(skb_cloned(skb) &&
+		     !skb_clone_writable(skb, offset + sizeof(sum))))
 		return -EFAULT;
 
 	ptr = skb_header_pointer(skb, offset, sizeof(sum), &sum);
@@ -1328,7 +1330,8 @@ static u64 bpf_l4_csum_replace(u64 r1, u64 offset, u64 from, u64 to, u64 flags)
 	if (unlikely(offset > 0xffff))
 		return -EFAULT;
 
-	if (skb_cloned(skb) && !skb_clone_writable(skb, offset + sizeof(sum)))
+	if (unlikely(skb_cloned(skb) &&
+		     !skb_clone_writable(skb, offset + sizeof(sum))))
 		return -EFAULT;
 
 	ptr = skb_header_pointer(skb, offset, sizeof(sum), &sum);
@@ -1381,8 +1384,6 @@ static u64 bpf_clone_redirect(u64 r1, u64 ifindex, u64 flags, u64 r4, u64 r5)
 	skb2 = skb_clone(skb, GFP_ATOMIC);
 	if (unlikely(!skb2))
 		return -ENOMEM;
-
-	skb_push(skb2, skb2->data - skb_mac_header(skb2));
 
 	if (BPF_IS_REDIRECT_INGRESS(flags))
 		return dev_forward_skb(dev, skb2);
