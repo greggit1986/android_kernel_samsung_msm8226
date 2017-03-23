@@ -786,19 +786,37 @@ static int pp_iface_stat_line(bool header, char *outp,
 			       "tx_other_bytes tx_other_packets\n"
 			);
 	} else {
+		struct rtnl_link_stats64 dev_stats, *stats;
+		__u64 rx_pkts, tx_pkts, rx_bytes, tx_bytes;
 		struct data_counters *cnts;
 		int cnt_set = 0;   /* We only use one set for the device */
 		cnts = &iface_entry->totals_via_skb;
+
+		if (iface_entry->active) {
+			stats = dev_get_stats(iface_entry->net_dev, &dev_stats);
+			rx_bytes = iface_entry->totals_via_dev[IFS_RX].bytes
+					+ stats->rx_bytes;
+			rx_pkts = iface_entry->totals_via_dev[IFS_RX].packets
+					+ stats->rx_packets;
+			tx_bytes = iface_entry->totals_via_dev[IFS_TX].bytes
+					+ stats->tx_bytes;
+			tx_pkts = iface_entry->totals_via_dev[IFS_TX].packets
+					+ stats->tx_packets;
+		} else {
+			rx_bytes = iface_entry->totals_via_dev[IFS_RX].bytes;
+			rx_pkts = iface_entry->totals_via_dev[IFS_RX].packets;
+			tx_bytes = iface_entry->totals_via_dev[IFS_TX].bytes;
+			tx_pkts = iface_entry->totals_via_dev[IFS_TX].packets;
+		}
+
 		len = snprintf(
 			outp, char_count,
 			"%s "
 			"%llu %llu %llu %llu %llu %llu %llu %llu "
 			"%llu %llu %llu %llu %llu %llu %llu %llu\n",
 			iface_entry->ifname,
-			dc_sum_bytes(cnts, cnt_set, IFS_RX),
-			dc_sum_packets(cnts, cnt_set, IFS_RX),
-			dc_sum_bytes(cnts, cnt_set, IFS_TX),
-			dc_sum_packets(cnts, cnt_set, IFS_TX),
+			rx_bytes, rx_pkts,
+			tx_bytes, tx_pkts,
 			cnts->bpc[cnt_set][IFS_RX][IFS_TCP].bytes,
 			cnts->bpc[cnt_set][IFS_RX][IFS_TCP].packets,
 			cnts->bpc[cnt_set][IFS_RX][IFS_UDP].bytes,
@@ -1741,6 +1759,7 @@ static bool qtaguid_mt(const struct sk_buff *skb, struct xt_action_param *par)
 	struct sock *sk;
 	uid_t sock_uid;
 	bool res;
+	bool set_sk_callback_lock = false;
 	/*
 	 * TODO: unhack how to force just accounting.
 	 * For now we only do tag stats when the uid-owner is not requested
@@ -1798,6 +1817,8 @@ static bool qtaguid_mt(const struct sk_buff *skb, struct xt_action_param *par)
 	MT_DEBUG("qtaguid[%d]: sk=%p got_sock=%d fam=%d proto=%d\n",
 		 par->hooknum, sk, got_sock, par->family, ipx_proto(skb, par));
 	if (sk != NULL) {
+		set_sk_callback_lock = true;
+		read_lock_bh(&sk->sk_callback_lock);
 		MT_DEBUG("qtaguid[%d]: sk=%p->sk_socket=%p->file=%p\n",
 			par->hooknum, sk, sk->sk_socket,
 			sk->sk_socket ? sk->sk_socket->file : (void *)-1LL);
@@ -1869,14 +1890,19 @@ static bool qtaguid_mt(const struct sk_buff *skb, struct xt_action_param *par)
 put_sock_ret_res:
 	if (got_sock)
 		xt_socket_put_sk(sk);
+	if (set_sk_callback_lock)
+		read_unlock_bh(&sk->sk_callback_lock);
 ret_res:
 	MT_DEBUG("qtaguid[%d]: left %d\n", par->hooknum, res);
 	return res;
 }
 
 #ifdef DDEBUG
-/* This function is not in xt_qtaguid_print.c because of locks visibility */
-static void prdebug_full_state(int indent_level, const char *fmt, ...)
+/*
+ * This function is not in xt_qtaguid_print.c because of locks visibility.
+ * The lock of sock_tag_list must be aquired before calling this function
+ */
+static void prdebug_full_state_locked(int indent_level, const char *fmt, ...)
 {
 	va_list args;
 	char *fmt_buff;
@@ -1897,16 +1923,12 @@ static void prdebug_full_state(int indent_level, const char *fmt, ...)
 	kfree(buff);
 	va_end(args);
 
-	spin_lock_bh(&sock_tag_list_lock);
 	prdebug_sock_tag_tree(indent_level, &sock_tag_tree);
-	spin_unlock_bh(&sock_tag_list_lock);
 
-	spin_lock_bh(&sock_tag_list_lock);
 	spin_lock_bh(&uid_tag_data_tree_lock);
 	prdebug_uid_tag_data_tree(indent_level, &uid_tag_data_tree);
 	prdebug_proc_qtu_data_tree(indent_level, &proc_qtu_data_tree);
 	spin_unlock_bh(&uid_tag_data_tree_lock);
-	spin_unlock_bh(&sock_tag_list_lock);
 
 	spin_lock_bh(&iface_stat_list_lock);
 	prdebug_iface_stat_list(indent_level, &iface_stat_list);
@@ -1915,7 +1937,7 @@ static void prdebug_full_state(int indent_level, const char *fmt, ...)
 	pr_debug("qtaguid: %s(): }\n", __func__);
 }
 #else
-static void prdebug_full_state(int indent_level, const char *fmt, ...) {}
+static void prdebug_full_state_locked(int indent_level, const char *fmt, ...) {}
 #endif
 
 /*
@@ -2020,7 +2042,7 @@ static int qtaguid_ctrl_proc_read(char *page, char **num_items_returned,
 
 	/* Count the following as part of the last item_index */
 	if (item_index > items_to_skip) {
-		prdebug_full_state(indent_level, "proc ctrl");
+		prdebug_full_state_locked(indent_level, "proc ctrl");
 	}
 
 	*eof = 1;
@@ -2884,8 +2906,10 @@ static int qtudev_release(struct inode *inode, struct file *file)
 
 	sock_tag_tree_erase(&st_to_free_tree);
 
-	prdebug_full_state(0, "%s(): pid=%u tgid=%u", __func__,
+	spin_lock_bh(&sock_tag_list_lock);
+	prdebug_full_state_locked(0, "%s(): pid=%u tgid=%u", __func__,
 			   current->pid, current->tgid);
+	spin_unlock_bh(&sock_tag_list_lock);
 	return 0;
 }
 
