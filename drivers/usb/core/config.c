@@ -907,12 +907,12 @@ int usb_get_bos_descriptor(struct usb_device *dev)
 	for (i = 0; i < num; i++) {
 		buffer += length;
 		cap = (struct usb_dev_cap_header *)buffer;
-		
+
 		if (total_len < sizeof(*cap) || total_len < cap->bLength) {
-            dev->bos->desc->bNumDeviceCaps = i;
+			dev->bos->desc->bNumDeviceCaps = i;
 			break;
 		}
-        length = cap->bLength;
+		length = cap->bLength;
 		total_len -= length;
 
 		if (cap->bDescriptorType != USB_DT_DEVICE_CAPABILITY) {
