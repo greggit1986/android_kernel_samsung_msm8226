@@ -887,10 +887,12 @@ int input_set_keycode(struct input_dev *dev,
 	} else if (test_bit(EV_KEY, dev->evbit) &&
 		   !is_event_supported(old_keycode, dev->keybit, KEY_MAX) &&
 		   __test_and_clear_bit(old_keycode, dev->key)) {
+		struct input_value vals[] =  {
+			{ EV_KEY, old_keycode, 0 },
+			input_value_sync
+		};
 
-		input_pass_event(dev, EV_KEY, old_keycode, 0);
-		if (dev->sync)
-			input_pass_event(dev, EV_SYN, SYN_REPORT, 1);
+		input_pass_values(dev, vals, ARRAY_SIZE(vals));
 	}
 
  out:
