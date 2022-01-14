@@ -137,6 +137,7 @@ static unsigned long one_ul = 1;
 static int one_hundred = 100;
 static int two_hundreds = 200;
 static int one_thousand = 1000;
+static int three_thousand = 3000;
 
 #ifdef CONFIG_INCREASE_MAXIMUM_SWAPPINESS
 extern int max_swappiness;
@@ -1119,7 +1120,7 @@ static struct ctl_table vm_table[] = {
 		.mode		= 0644,
 		.proc_handler	= watermark_scale_factor_sysctl_handler,
 		.extra1		= &one,
-		.extra2		= &one_thousand,
+		.extra2		= &three_thousand,
 	},
 	{
 		.procname	= "overcommit_ratio",
