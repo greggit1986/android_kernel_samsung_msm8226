@@ -725,7 +725,9 @@ static int mdss_dsi_parse_dcs_cmds(struct device_node *np,
 
 	return 0;
 }
-static int mdss_panel_dt_get_dst_fmt(u32 bpp, char mipi_mode, u32 pixel_packing,
+/*JJEDIT static int mdss_panel_dt_get_dst_fmt(u32 bpp, char mipi_mode, u32 pixel_packing,
+				char *dst_format)*/
+int mdss_panel_dt_get_dst_fmt(u32 bpp, char mipi_mode, u32 pixel_packing,
 				char *dst_format)
 {
 	int rc = 0;
