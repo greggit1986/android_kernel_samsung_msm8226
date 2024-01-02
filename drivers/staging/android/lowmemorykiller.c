@@ -62,6 +62,10 @@
 #define _ZONE ZONE_NORMAL
 #endif
 
+//JJEDIT START
+#include <linux/seq_file.h>
+//JJEDIT END
+
 static uint32_t lowmem_debug_level = 1;
 static int lowmem_adj[6] = {
 	0,

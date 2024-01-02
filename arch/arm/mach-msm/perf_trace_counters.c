@@ -15,6 +15,10 @@
 #define CREATE_TRACE_POINTS
 #include "perf_trace_counters.h"
 
+//JJEDIT START
+#include <linux/cpu.h>
+//JJEDIT END
+
 static unsigned int tp_pid_state;
 
 DEFINE_PER_CPU(u32, previous_ccnt);
