@@ -23,9 +23,14 @@
 #if defined(CONFIG_TZ_ICCC)
 #include <linux/security/iccc_interface.h>
 int dmv_check_failed;
+
+#ifdef CONFIG_DM_ANDROID_VERITY
+#include "dm-android-verity.h"
+#else
+#define DM_MSG_PREFIX			"verity"
 #endif
 
-#define DM_MSG_PREFIX			"verity"
+/*#define DM_MSG_PREFIX			"verity"*/
 
 #define DM_VERITY_IO_VEC_INLINE		16
 #define DM_VERITY_MEMPOOL_SIZE		4
@@ -1423,6 +1428,12 @@ static int __init dm_verity_init(void)
 	r = dm_register_target(&verity_target);
 	if (r < 0)
 		DMERR("register failed %d", r);
+
+#ifdef CONFIG_DM_ANDROID_VERITY
+	r = dm_register_target(&android_verity_target);
+	if (r < 0)
+		DMERR("register failed %d", r);
+#endif
 
 	return r;
 }
