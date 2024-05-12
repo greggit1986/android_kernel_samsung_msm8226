@@ -406,6 +406,7 @@ static struct msm_gpiomux_config msm_blsp_configs[] __initdata = {
 	},
 #if !defined (CONFIG_SEC_MILLET_PROJECT) && !defined(CONFIG_SEC_MATISSE_PROJECT)
 #if !defined(CONFIG_MACH_AFYONLTE_TMO) && !defined(CONFIG_MACH_AFYONLTE_CAN)
+
 	{
 		.gpio      = 0,		/* BLSP1 QUP1 SPI_DATA_MOSI */
 		.settings = {
