@@ -91,8 +91,11 @@ static int pcpu_alloc_pages(struct pcpu_chunk *chunk,
 			struct page **pagep = &pages[pcpu_page_idx(cpu, i)];
 
 			*pagep = alloc_pages_node(cpu_to_node(cpu), gfp, 0);
-			if (!*pagep)
-				goto err;
+			if (!*pagep) {
+				pcpu_free_pages(chunk, pages,
+						page_start, page_end);
+				return -ENOMEM;
+			}
 		}
 	}
 	return 0;
