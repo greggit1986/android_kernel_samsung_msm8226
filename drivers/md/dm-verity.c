@@ -24,6 +24,7 @@
 #if defined(CONFIG_TZ_ICCC)
 #include <linux/security/iccc_interface.h>
 int dmv_check_failed;
+#endif
 
 #ifdef CONFIG_DM_ANDROID_VERITY
 #include "dm-android-verity.h"
