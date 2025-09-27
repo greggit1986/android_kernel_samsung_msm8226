@@ -3985,6 +3985,8 @@ SYSCALL_DEFINE5(renameat2, int, olddfd, const char __user *, oldname,
 	struct filename *to;
 	int error;
 
+ #define RENAME_NOREPLACE	(1 << 0)	/* Don't overwrite target */
+
 	if (flags & ~RENAME_NOREPLACE)
 		return -EINVAL;
 
