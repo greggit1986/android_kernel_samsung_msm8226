@@ -1771,6 +1771,8 @@ void regulatory_hint_11d(struct wiphy *wiphy,
 	enum environment_cap env = ENVIRON_ANY;
 	struct regulatory_request *request;
 
+	return;
+
 	/* Driver does not want the CORE to change the channel
 	 * flags based on the country IE of connected BSS
 	 */
