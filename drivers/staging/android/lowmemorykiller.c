@@ -45,6 +45,7 @@
 #include <linux/slab.h>
 #include <linux/poll.h>
 #include <linux/mutex.h>
+#include <linux/mmzone.h>
 #include <linux/delay.h>
 #include <linux/swap.h>
 #include <linux/fs.h>
@@ -512,6 +513,12 @@ void tune_lmk_param(int *other_free, int *other_file, struct shrink_control *sc)
 	}
 }
 
+static inline bool is_secondary_kswapd(void)
+{
+	return current_is_kswapd() &&
+		current != NODE_DATA(numa_node_id())->kswapd[0];
+}
+
 static int lowmem_shrink(struct shrinker *s, struct shrink_control *sc)
 {
 	struct task_struct *tsk;
@@ -528,6 +535,9 @@ static int lowmem_shrink(struct shrinker *s, struct shrink_control *sc)
 	int other_free;
 	int other_file;
 	unsigned long nr_to_scan = sc->nr_to_scan;
+
+	if (is_secondary_kswapd())
+		return 0;
 
 	if (nr_to_scan > 0) {
 		if (mutex_lock_interruptible(&scan_mutex) < 0)
