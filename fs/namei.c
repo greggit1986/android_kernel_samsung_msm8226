@@ -680,7 +680,6 @@ static inline void put_link(struct nameidata *nd, struct path *link, void *cooki
 
 int sysctl_protected_symlinks __read_mostly = 1;
 int sysctl_protected_hardlinks __read_mostly = 1;
->>>>>>> 614af64ef0e... fs: add link restrictions
 
 /**
  * may_follow_link - Check symlink following for unsafe situations
